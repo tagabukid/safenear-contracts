@@ -4,7 +4,9 @@
 //! - Fixed supply: 1,000,000,000 tokens are minted once in `new`. There is no mint function.
 //! - No admin: the creator has no special powers. The factory deploys this contract to an
 //!   account with no access keys, so the code can never be changed or upgraded.
-//! - Tax cap: trade tax is capped at 10% (MAX_TAX_BPS) and is fixed at launch.
+//! - Tax cap: buy and sell tax are each capped at 4% (MAX_TAX_BPS) and fixed at launch.
+//!   Tax is split between the fee wallet and a "burn" that stays in the curve, raising the
+//!   price for every holder.
 //! - Locked liquidity: on graduation, all raised NEAR + the LP token allocation go into a
 //!   Ref Finance pool. The LP shares stay in this contract's Ref account and there is no
 //!   method to withdraw them, so the liquidity is locked forever.
@@ -37,7 +39,7 @@ const TOTAL_SUPPLY: u128 = 1_000_000_000 * ONE_TOKEN;
 const CURVE_SUPPLY: u128 = 800_000_000 * ONE_TOKEN;
 /// 20% is paired with the raised NEAR in the Ref Finance pool at graduation.
 const LP_SUPPLY: u128 = TOTAL_SUPPLY - CURVE_SUPPLY;
-const MAX_TAX_BPS: u16 = 1_000; // 10%
+const MAX_TAX_BPS: u16 = 400; // 4% a side
 const BPS: u128 = 10_000;
 const MIN_BUY: u128 = 10_000_000_000_000_000_000_000; // 0.01 NEAR
 const MAX_TRADES: usize = 30;
@@ -135,7 +137,13 @@ pub struct CurveView {
     pub near_reserve: U128,
     pub graduation_threshold: U128,
     pub graduated: bool,
+    /// the higher of buy/sell tax (kept for older frontends)
     pub tax_bps: u16,
+    pub buy_tax_bps: u16,
+    pub sell_tax_bps: u16,
+    /// share of the tax kept in the curve (0..10000); the rest goes to fee_recipient
+    pub burn_bps: u16,
+    pub fee_recipient: AccountId,
     pub creator: AccountId,
     /// yoctoNEAR per 1 whole token
     pub price: U128,
@@ -161,7 +169,10 @@ pub struct Contract {
     dev_buy_tokens: u128,
     creator: AccountId,
     factory: AccountId,
-    tax_bps: u16,
+    buy_tax_bps: u16,
+    sell_tax_bps: u16,
+    burn_bps: u16,
+    fee_recipient: AccountId,
     virtual_near: u128,
     virtual_tokens: u128,
     near_reserve: u128,
@@ -188,7 +199,8 @@ impl Contract {
         symbol: String,
         icon: Option<String>,
         creator: AccountId,
-        tax_bps: u16,
+        buy_tax_bps: u16,
+        sell_tax_bps: u16,
         graduation_threshold: U128,
         virtual_near: U128,
         ref_contract: AccountId,
@@ -198,8 +210,16 @@ impl Contract {
         twitter: Option<String>,
         telegram: Option<String>,
         initial_buy: Option<U128>,
+        fee_recipient: Option<AccountId>,
+        burn_bps: Option<u16>,
     ) -> Self {
-        require!(tax_bps <= MAX_TAX_BPS, "Tax above 10% is not allowed");
+        require!(
+            buy_tax_bps <= MAX_TAX_BPS && sell_tax_bps <= MAX_TAX_BPS,
+            "Tax above 4% a side is not allowed"
+        );
+        let burn_bps = burn_bps.unwrap_or(0);
+        require!(burn_bps as u128 <= BPS, "burn_bps must be between 0 and 10000");
+        let fee_recipient = fee_recipient.unwrap_or_else(|| creator.clone());
         if let Some(i) = &icon {
             require!(i.len() <= MAX_ICON_LEN, "Image is too large (max 12 KB)");
         }
@@ -240,7 +260,10 @@ impl Contract {
             dev_buy_tokens: 0,
             creator,
             factory: env::predecessor_account_id(),
-            tax_bps,
+            buy_tax_bps,
+            sell_tax_bps,
+            burn_bps,
+            fee_recipient,
             virtual_near: v,
             virtual_tokens,
             near_reserve: 0,
@@ -311,7 +334,7 @@ impl Contract {
     /// Caps the buy so the curve never goes past the graduation threshold.
     fn split_buy(&self, deposit: u128) -> (u128, u128, u128, u128) {
         let room = self.graduation_threshold - self.near_reserve;
-        let bps = self.tax_bps as u128;
+        let bps = self.buy_tax_bps as u128;
         let max_gross = (room * BPS + (BPS - bps) - 1) / (BPS - bps); // ceil
         let gross = deposit.min(max_gross);
         let refund = deposit - gross;
@@ -339,6 +362,12 @@ impl Contract {
             .record_event(account_id, kind.to_string(), U128(near_amount));
     }
 
+    /// (to fee wallet, kept in curve)
+    fn split_tax(&self, tax: u128) -> (u128, u128) {
+        let burned = tax * self.burn_bps as u128 / BPS;
+        (tax - burned, burned)
+    }
+
     fn record(&mut self, side: &str, account_id: AccountId, near_amount: u128, token_amount: u128) {
         if self.trades.len() >= MAX_TRADES {
             self.trades.remove(0);
@@ -359,7 +388,11 @@ impl Contract {
             near_reserve: U128(self.near_reserve),
             graduation_threshold: U128(self.graduation_threshold),
             graduated: self.graduated,
-            tax_bps: self.tax_bps,
+            tax_bps: self.buy_tax_bps.max(self.sell_tax_bps),
+            buy_tax_bps: self.buy_tax_bps,
+            sell_tax_bps: self.sell_tax_bps,
+            burn_bps: self.burn_bps,
+            fee_recipient: self.fee_recipient.clone(),
             creator: self.creator.clone(),
             price: U128(mul_div(self.x(), ONE_TOKEN, self.y().max(1))),
             pool_id: self.pool_id,
@@ -384,7 +417,7 @@ impl Contract {
             return U128(0);
         }
         let gross = self.near_out(tokens_in.0);
-        U128(gross - gross * self.tax_bps as u128 / BPS)
+        U128(gross - gross * self.sell_tax_bps as u128 / BPS)
     }
 
     pub fn get_recent_trades(&self, limit: Option<u32>) -> Vec<Trade> {
@@ -429,14 +462,16 @@ impl Contract {
         require!(out >= min_tokens_out.0, "Price moved past your slippage. Try again.");
 
         let me = env::current_account_id();
-        self.near_reserve += net;
+        let (to_wallet, burned) = self.split_tax(tax);
+        // The burned share stays in the curve without minting tokens, so the price rises for everyone.
+        self.near_reserve += net + burned;
         self.curve_tokens_left -= out;
         self.token.internal_transfer(&me, &buyer, out, Some("SafeNear buy".into()));
         self.record("buy", buyer.clone(), net, out);
         self.report(buyer.clone(), "buy", net);
 
-        if tax > 0 {
-            Promise::new(self.creator.clone()).transfer(NearToken::from_yoctonear(tax));
+        if to_wallet > 0 {
+            Promise::new(self.fee_recipient.clone()).transfer(NearToken::from_yoctonear(to_wallet));
         }
         if refund > 0 {
             Promise::new(buyer).transfer(NearToken::from_yoctonear(refund));
@@ -466,21 +501,22 @@ impl Contract {
         require!(amount > 0, "Amount must be positive");
 
         let gross = self.near_out(amount);
-        let tax = gross * self.tax_bps as u128 / BPS;
+        let tax = gross * self.sell_tax_bps as u128 / BPS;
         let net = gross - tax;
+        let (to_wallet, burned) = self.split_tax(tax);
         require!(net > 0, "Amount too small");
         require!(net >= min_near_out.0, "Price moved past your slippage. Try again.");
 
         let me = env::current_account_id();
         self.token.internal_transfer(&seller, &me, amount, Some("SafeNear sell".into()));
-        self.near_reserve -= gross;
+        self.near_reserve -= gross - burned;
         self.curve_tokens_left += amount;
         self.record("sell", seller.clone(), gross, amount);
         self.report(seller.clone(), "sell", gross);
 
         Promise::new(seller).transfer(NearToken::from_yoctonear(net));
-        if tax > 0 {
-            Promise::new(self.creator.clone()).transfer(NearToken::from_yoctonear(tax));
+        if to_wallet > 0 {
+            Promise::new(self.fee_recipient.clone()).transfer(NearToken::from_yoctonear(to_wallet));
         }
         U128(net)
     }
@@ -742,12 +778,15 @@ mod tests {
             None,
             accounts(0),
             tax_bps,
+            tax_bps,
             U128(10 * NEAR),
             U128(3 * NEAR),
             "ref-finance-101.testnet".parse().unwrap(),
             "wrap.testnet".parse().unwrap(),
             Some("Run fast".into()),
             Some("https://dash.example".into()),
+            None,
+            None,
             None,
             None,
             None,
@@ -807,10 +846,10 @@ mod tests {
             .account_balance(NearToken::from_near(20));
         testing_env!(ctx.build());
         let c = Contract::new(
-            "Dash".into(), "DASH".into(), None, accounts(0), 100,
+            "Dash".into(), "DASH".into(), None, accounts(0), 100, 100,
             U128(10 * NEAR), U128(3 * NEAR),
             "ref-finance-101.testnet".parse().unwrap(), "wrap.testnet".parse().unwrap(),
-            None, None, None, None, Some(U128(9 * NEAR)),
+            None, None, None, None, Some(U128(9 * NEAR)), None, None,
         );
         assert_eq!(c.dev_buy_tokens, MAX_DEV_TOKENS);
         assert_eq!(c.ft_balance_of(accounts(0)).0, MAX_DEV_TOKENS);
@@ -826,16 +865,40 @@ mod tests {
             .predecessor_account_id("safenear.testnet".parse().unwrap());
         testing_env!(ctx.build());
         Contract::new(
-            "Dash".into(), "DASH".into(), None, accounts(0), 100,
+            "Dash".into(), "DASH".into(), None, accounts(0), 100, 100,
             U128(10 * NEAR), U128(3 * NEAR),
             "ref-finance-101.testnet".parse().unwrap(), "wrap.testnet".parse().unwrap(),
-            None, Some("javascript:alert(1)".into()), None, None, None,
+            None, Some("javascript:alert(1)".into()), None, None, None, None, None,
         );
     }
 
     #[test]
-    #[should_panic(expected = "Tax above 10%")]
+    #[should_panic(expected = "Tax above 4% a side")]
     fn tax_is_capped() {
-        setup(1_001);
+        setup(401);
+    }
+
+    #[test]
+    fn burned_tax_raises_price() {
+        let mut ctx = VMContextBuilder::new();
+        ctx.current_account_id("dash.safenear.testnet".parse().unwrap())
+            .predecessor_account_id("safenear.testnet".parse().unwrap())
+            .account_balance(NearToken::from_near(10));
+        testing_env!(ctx.build());
+        let mut c = Contract::new(
+            "Dash".into(), "DASH".into(), None, accounts(0), 400, 400,
+            U128(10 * NEAR), U128(3 * NEAR),
+            "ref-finance-101.testnet".parse().unwrap(), "wrap.testnet".parse().unwrap(),
+            None, None, None, None, None, Some(accounts(2)), Some(10_000),
+        );
+        let user = accounts(1);
+        c.token.internal_register_account(&user);
+        as_user(user.clone(), NEAR);
+        let price_before = c.get_curve().price.0;
+        c.buy(U128(0));
+        // all 4% tax burned: the whole deposit ends up in the curve
+        assert_eq!(c.near_reserve, NEAR);
+        assert!(c.get_curve().price.0 > price_before);
+        assert_eq!(c.get_curve().fee_recipient, accounts(2));
     }
 }
