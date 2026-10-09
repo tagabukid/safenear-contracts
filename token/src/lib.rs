@@ -45,6 +45,20 @@ const MAX_TRADES: usize = 30;
 const REF_POOL_FEE: u32 = 30;
 /// The final graduation step index; migration_step == DONE means LP is in place and locked.
 const DONE: u8 = 7;
+/// Creator's buy at launch is capped at 5% of supply.
+const MAX_DEV_TOKENS: u128 = 50_000_000 * ONE_TOKEN;
+const MAX_ICON_LEN: usize = 12_000;
+const MAX_LINK_LEN: usize = 200;
+const MAX_DESC_LEN: usize = 280;
+
+fn check_link(v: &Option<String>, what: &str) {
+    if let Some(l) = v {
+        require!(
+            l.len() <= MAX_LINK_LEN && l.starts_with("https://"),
+            format!("{} must be an https:// link up to 200 characters", what)
+        );
+    }
+}
 
 fn tgas(n: u64) -> Gas {
     Gas::from_tgas(n)
@@ -52,6 +66,12 @@ fn tgas(n: u64) -> Gas {
 
 fn mul_div(a: u128, b: u128, c: u128) -> u128 {
     (U256::from(a) * U256::from(b) / U256::from(c)).as_u128()
+}
+
+fn mul_div_ceil(a: u128, b: u128, c: u128) -> u128 {
+    let n = U256::from(a) * U256::from(b);
+    let c = U256::from(c);
+    ((n + c - U256::from(1u8)) / c).as_u128()
 }
 
 #[ext_contract(ext_ref)]
@@ -101,6 +121,16 @@ pub struct Trade {
 }
 
 #[near(serializers = [json])]
+pub struct InfoView {
+    pub icon: Option<String>,
+    pub description: Option<String>,
+    pub website: Option<String>,
+    pub twitter: Option<String>,
+    pub telegram: Option<String>,
+    pub dev_buy_tokens: U128,
+}
+
+#[near(serializers = [json])]
 pub struct CurveView {
     pub near_reserve: U128,
     pub graduation_threshold: U128,
@@ -124,6 +154,11 @@ pub struct Contract {
     name: String,
     symbol: String,
     icon: Option<String>,
+    description: Option<String>,
+    website: Option<String>,
+    twitter: Option<String>,
+    telegram: Option<String>,
+    dev_buy_tokens: u128,
     creator: AccountId,
     factory: AccountId,
     tax_bps: u16,
@@ -158,8 +193,22 @@ impl Contract {
         virtual_near: U128,
         ref_contract: AccountId,
         wrap_contract: AccountId,
+        description: Option<String>,
+        website: Option<String>,
+        twitter: Option<String>,
+        telegram: Option<String>,
+        initial_buy: Option<U128>,
     ) -> Self {
         require!(tax_bps <= MAX_TAX_BPS, "Tax above 10% is not allowed");
+        if let Some(i) = &icon {
+            require!(i.len() <= MAX_ICON_LEN, "Image is too large (max 12 KB)");
+        }
+        if let Some(d) = &description {
+            require!(d.len() <= MAX_DESC_LEN, "Description is too long (max 280 characters)");
+        }
+        check_link(&website, "Website");
+        check_link(&twitter, "X link");
+        check_link(&telegram, "Telegram link");
         let r = graduation_threshold.0;
         let v = virtual_near.0;
         require!(r > 0 && v > 0, "Curve parameters must be positive");
@@ -179,11 +228,16 @@ impl Contract {
         }
         .emit();
 
-        Self {
+        let mut this = Self {
             token,
             name,
             symbol,
             icon,
+            description,
+            website,
+            twitter,
+            telegram,
+            dev_buy_tokens: 0,
             creator,
             factory: env::predecessor_account_id(),
             tax_bps,
@@ -202,6 +256,44 @@ impl Contract {
             migrate_caller: None,
             pool_id: None,
             trades: Vec::new(),
+        };
+
+        let dev = initial_buy.map(|v| v.0).unwrap_or(0);
+        if dev > 0 {
+            this.dev_buy(dev);
+        }
+        this
+    }
+
+    /// The creator's buy at launch, paid with NEAR the factory forwarded to this account.
+    /// No tax, capped at 5% of supply, and never fills the curve. Unused NEAR is refunded.
+    fn dev_buy(&mut self, amount: u128) {
+        let me = env::current_account_id();
+        let creator = self.creator.clone();
+        if !self.token.accounts.contains_key(&creator) {
+            self.token.internal_register_account(&creator);
+        }
+        let room = self.graduation_threshold - self.near_reserve - 1;
+        let mut net = amount.min(room);
+        let (x, y) = (self.x(), self.y());
+        let mut out = mul_div(y, net, x + net);
+        if out > MAX_DEV_TOKENS {
+            out = MAX_DEV_TOKENS;
+            net = mul_div_ceil(x, out, y - out).min(net);
+        }
+        out = out.min(self.curve_tokens_left);
+        let refund = amount - net;
+
+        if out > 0 {
+            self.near_reserve += net;
+            self.curve_tokens_left -= out;
+            self.dev_buy_tokens = out;
+            self.token.internal_transfer(&me, &creator, out, Some("SafeNear dev buy".into()));
+            self.record("buy", creator.clone(), net, out);
+            log!("DEV BUY: creator bought {} tokens for {} yoctoNEAR", out, net);
+        }
+        if refund > 0 {
+            Promise::new(creator).transfer(NearToken::from_yoctonear(refund));
         }
     }
 
@@ -298,6 +390,17 @@ impl Contract {
     pub fn get_recent_trades(&self, limit: Option<u32>) -> Vec<Trade> {
         let n = limit.unwrap_or(25) as usize;
         self.trades.iter().rev().take(n).cloned().collect()
+    }
+
+    pub fn get_info(&self) -> InfoView {
+        InfoView {
+            icon: self.icon.clone(),
+            description: self.description.clone(),
+            website: self.website.clone(),
+            twitter: self.twitter.clone(),
+            telegram: self.telegram.clone(),
+            dev_buy_tokens: U128(self.dev_buy_tokens),
+        }
     }
 
     pub fn get_factory(&self) -> AccountId {
@@ -643,6 +746,11 @@ mod tests {
             U128(3 * NEAR),
             "ref-finance-101.testnet".parse().unwrap(),
             "wrap.testnet".parse().unwrap(),
+            Some("Run fast".into()),
+            Some("https://dash.example".into()),
+            None,
+            None,
+            None,
         )
     }
 
@@ -689,6 +797,40 @@ mod tests {
         assert!(c.graduated);
         assert_eq!(c.near_reserve, 10 * NEAR);
         assert_eq!(c.lp_tokens, LP_SUPPLY);
+    }
+
+    #[test]
+    fn dev_buy_is_capped_at_five_percent() {
+        let mut ctx = VMContextBuilder::new();
+        ctx.current_account_id("dash.safenear.testnet".parse().unwrap())
+            .predecessor_account_id("safenear.testnet".parse().unwrap())
+            .account_balance(NearToken::from_near(20));
+        testing_env!(ctx.build());
+        let c = Contract::new(
+            "Dash".into(), "DASH".into(), None, accounts(0), 100,
+            U128(10 * NEAR), U128(3 * NEAR),
+            "ref-finance-101.testnet".parse().unwrap(), "wrap.testnet".parse().unwrap(),
+            None, None, None, None, Some(U128(9 * NEAR)),
+        );
+        assert_eq!(c.dev_buy_tokens, MAX_DEV_TOKENS);
+        assert_eq!(c.ft_balance_of(accounts(0)).0, MAX_DEV_TOKENS);
+        assert!(!c.graduated);
+        assert!(c.near_reserve < 9 * NEAR);
+    }
+
+    #[test]
+    #[should_panic(expected = "https:// link")]
+    fn links_must_be_https() {
+        let mut ctx = VMContextBuilder::new();
+        ctx.current_account_id("dash.safenear.testnet".parse().unwrap())
+            .predecessor_account_id("safenear.testnet".parse().unwrap());
+        testing_env!(ctx.build());
+        Contract::new(
+            "Dash".into(), "DASH".into(), None, accounts(0), 100,
+            U128(10 * NEAR), U128(3 * NEAR),
+            "ref-finance-101.testnet".parse().unwrap(), "wrap.testnet".parse().unwrap(),
+            None, Some("javascript:alert(1)".into()), None, None, None,
+        );
     }
 
     #[test]
