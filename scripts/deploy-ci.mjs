@@ -35,13 +35,17 @@ const owner = (process.env.NEAR_OWNER_ID || "").trim() || accountId;
 const DO_DEPLOY = process.env.DO_DEPLOY === "true";
 const DO_PUBLISH = process.env.DO_PUBLISH === "true";
 const DO_CURVE = process.env.DO_CURVE === "true";
+const DO_FEE = process.env.DO_FEE === "true";
+const LAUNCH_FEE = Number(process.env.LAUNCH_FEE || "0.25");
+const TOKEN_ACCOUNT_BALANCE = 0.25; // NEAR each token account needs for its own state in cheap mode
+if (!(LAUNCH_FEE >= 0 && LAUNCH_FEE <= 10)) fail("Bad launch fee", `launch_fee is "${process.env.LAUNCH_FEE}". Use a number of NEAR between 0 and 10, for example 0 or 0.25.`);
 const CURVE_GRAD = Number(process.env.CURVE_GRAD || "100");
 const CURVE_VIRTUAL = Number(process.env.CURVE_VIRTUAL || "30");
 if (DO_CURVE) {
   if (!(CURVE_GRAD >= 1 && CURVE_GRAD <= 100000)) fail("Bad graduation amount", `graduation_near is "${process.env.CURVE_GRAD}". Use a number of NEAR, for example 100.`);
   if (!(CURVE_VIRTUAL > 0 && CURVE_VIRTUAL <= CURVE_GRAD * 5)) fail("Bad virtual reserve", `virtual_near is "${process.env.CURVE_VIRTUAL}". Use a number around 30% of graduation, for example 30 for 100.`);
 }
-if (!DO_DEPLOY && !DO_PUBLISH && !DO_CURVE) { console.log("Nothing to do (deploy and publish are both off)."); process.exit(0); }
+if (!DO_DEPLOY && !DO_PUBLISH && !DO_CURVE && !DO_FEE) { console.log("Nothing to do (deploy and publish are both off)."); process.exit(0); }
 
 // 1. Secrets present?
 const SECRET = (n) => NETWORK === "mainnet" ? "MAINNET_" + n : "NEAR_" + n;
@@ -110,6 +114,11 @@ try {
 try {
   const r = await account.functionCall({ contractId: accountId, methodName: "new", args: initArgs, gas: "100000000000000" });
   console.log("Initialized. Tx:", r.transaction.hash);
+  if (NETWORK === "mainnet") {
+    // The testnet points campaign doesn't run on mainnet (it would let anyone grow the factory's storage).
+    await account.functionCall({ contractId: accountId, methodName: "set_points_open", args: { open: false }, gas: "30000000000000" });
+    console.log("Mainnet: points campaign turned off.");
+  }
 } catch (e) {
   const m = String(e?.message || e);
   if (/already been initialized|already initialized/i.test(m)) console.log("Already initialized, code updated only.");
@@ -149,14 +158,26 @@ if (DO_PUBLISH) {
     console.log(`Token code: ${(mode.token_code_bytes / 1024).toFixed(0)} KB. Publishing burns ${cost.toFixed(2)} NEAR once. Balance: ${now.toFixed(2)} NEAR.`);
     if (now < need) fail(`Not enough ${NETWORK} NEAR to publish`, `Publishing burns ${cost.toFixed(2)} NEAR once, and ${lockedForStorage.toFixed(2)} NEAR must stay locked for the factory's own storage. ${accountId} has ${now.toFixed(2)} NEAR; it needs about ${need.toFixed(1)} (${Math.max(0, need - now).toFixed(1)} more). Send more NEAR to it and run again with only Publish checked.`);
     try {
-      const r = await account.functionCall({ contractId: accountId, methodName: "publish_token_code", args: { creation_fee: NEAR(0.7), token_account_balance: NEAR(0.6) }, gas: "300000000000000" });
+      const r = await account.functionCall({ contractId: accountId, methodName: "publish_token_code", args: { creation_fee: NEAR(LAUNCH_FEE), token_account_balance: NEAR(TOKEN_ACCOUNT_BALANCE) }, gas: "300000000000000" });
       console.log("Publish tx:", r.transaction.hash);
     } catch (e) { fail("Publishing failed", String(e?.message || e).replace(/\s+/g, " ").slice(0, 300)); }
     const after = await view("get_launch_mode");
     if (!after.global) fail("Publishing didn't switch on", `The publish transaction ran but cheap launches are still off. Check it on ${NET.explorer}.`);
-    note(`Cheap launches are ON. Each launch now costs ${(Number(BigInt(after.creation_fee) / 10n ** 21n) / 1000)} NEAR (was 5 NEAR).`);
+    const f = Number(BigInt(after.creation_fee) / 10n ** 21n) / 1000;
+    note(`Cheap launches are ON. Each launch now costs ${f} NEAR${after.subsidized ? ` (SafeNear covers the rest of the ~${TOKEN_ACCOUNT_BALANCE} NEAR storage; ${after.free_launches_per_day} subsidized launch per account per day)` : ""}.`);
   }
 }
 
-console.log(`\nDone! Site: ?network=${NETWORK}&factory=${accountId}`);
+// 10. Change the launch fee (cheap mode only)
+if (DO_FEE) {
+  try {
+    await account.functionCall({ contractId: accountId, methodName: "set_global_config", args: { enabled: true, creation_fee: NEAR(LAUNCH_FEE), token_account_balance: NEAR(TOKEN_ACCOUNT_BALANCE) }, gas: "30000000000000" });
+  } catch (e) {
+    const m = String(e?.message || e);
+    if (/Publish the token code first/.test(m)) fail("Publish first", "The launch fee can only be changed after Publish (cheap launches). Run Publish first.");
+    fail("Fee update failed", m.replace(/\s+/g, " ").slice(0, 300));
+  }
+  note(`Launch fee is now ${LAUNCH_FEE} NEAR${LAUNCH_FEE < TOKEN_ACCOUNT_BALANCE ? ` (SafeNear covers the storage; 1 subsidized launch per account per day)` : ""}.`);
+}
 
+console.log(`\nDone! Site: ?network=${NETWORK}&factory=${accountId}`);
