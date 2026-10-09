@@ -20,6 +20,12 @@ const GLOBAL_KEY: &[u8] = b"__safenear_global";
 /// SafeNear platform fee settings, also under their own key (no state migration).
 const PLATFORM_KEY: &[u8] = b"__safenear_platform";
 const DEFAULT_PLATFORM_FEE_BPS: u16 = 50; // 0.5% per trade
+/// When the launch fee is below the token account's storage, the factory pays the difference.
+/// To stop someone draining it with scripts, each account gets this many subsidized launches per day.
+const FREE_LAUNCHES_PER_DAY: u8 = 1;
+const FREE_LAUNCH_PREFIX: &[u8] = b"__fl:";
+/// The factory always keeps this much free so subsidies can't eat into its own storage.
+const SUBSIDY_RESERVE: u128 = 1_000_000_000_000_000_000_000_000; // 1 NEAR
 const MAX_PLATFORM_FEE_BPS: u16 = 100; // 1%
 const MIN_DEV_BUY: u128 = 10_000_000_000_000_000_000_000; // 0.01 NEAR
 const MAX_ICON_LEN: usize = 12_000;
@@ -99,6 +105,9 @@ pub struct LaunchModeView {
     pub token_code_bytes: u64,
     /// One-time NEAR burned to publish the token code globally (10 NEAR per 100 KB)
     pub publish_cost: U128,
+    /// true when SafeNear pays part or all of the launch storage
+    pub subsidized: bool,
+    pub free_launches_per_day: u8,
 }
 
 #[near(serializers = [json])]
@@ -230,6 +239,8 @@ impl Factory {
             token_account_balance: U128(bal),
             token_code_bytes: TOKEN_WASM.len() as u64,
             publish_cost: U128(TOKEN_WASM.len() as u128 * 10 * env::storage_byte_cost().as_yoctonear()),
+            subsidized: bal > fee,
+            free_launches_per_day: FREE_LAUNCHES_PER_DAY,
         }
     }
 
@@ -257,6 +268,26 @@ impl Factory {
         let deposit = env::attached_deposit().as_yoctonear();
         let (fee, account_balance, global_hash) = self.launch_terms();
         require!(deposit >= fee, format!("Attach at least {} yoctoNEAR", fee));
+        if account_balance > fee {
+            // Subsidized launch: the factory covers (account_balance - fee).
+            let today = env::block_timestamp_ms() / DAY_MS;
+            let key = [FREE_LAUNCH_PREFIX, creator.as_str().as_bytes()].concat();
+            let (day, used): (u64, u8) = env::storage_read(&key)
+                .and_then(|b| near_sdk::borsh::from_slice(&b).ok())
+                .unwrap_or((0, 0));
+            let used = if day == today { used } else { 0 };
+            require!(
+                used < FREE_LAUNCHES_PER_DAY,
+                "You've used your free launch for today. Try again tomorrow."
+            );
+            env::storage_write(&key, &near_sdk::borsh::to_vec(&(today, used + 1)).unwrap());
+            let locked = env::storage_usage() as u128 * env::storage_byte_cost().as_yoctonear();
+            let free = env::account_balance().as_yoctonear().saturating_sub(locked);
+            require!(
+                free >= (account_balance - fee) + SUBSIDY_RESERVE,
+                "Free launches are paused right now (the SafeNear treasury is topping up). Try again later."
+            );
+        }
         let name = name.trim().to_string();
         require!(!name.is_empty() && name.len() <= 32, "Name must be 1 to 32 characters");
         let symbol = symbol.trim().to_uppercase();
@@ -516,7 +547,6 @@ impl Factory {
     /// Burns about 10 NEAR per 100 KB of token code from the factory balance (see get_launch_mode).
     pub fn publish_token_code(&mut self, creation_fee: U128, token_account_balance: U128) -> Promise {
         self.assert_owner();
-        require!(token_account_balance.0 <= creation_fee.0, "token_account_balance must be <= creation_fee");
         let hash = env::sha256_array(TOKEN_WASM);
         Promise::new(env::current_account_id())
             .deploy_global_contract(TOKEN_WASM.to_vec())
@@ -551,7 +581,6 @@ impl Factory {
         g.enabled = enabled;
         if let Some(v) = creation_fee { g.creation_fee = v.0; }
         if let Some(v) = token_account_balance { g.token_account_balance = v.0; }
-        require!(g.token_account_balance <= g.creation_fee, "token_account_balance must be <= creation_fee");
         env::storage_write(GLOBAL_KEY, &near_sdk::borsh::to_vec(&g).unwrap());
     }
 
