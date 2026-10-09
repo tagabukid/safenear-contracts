@@ -17,6 +17,10 @@ const MAX_TAX_BPS: u16 = 400; // 4% a side
 /// Global-contract launch settings live under their own storage key, so adding them
 /// doesn't change the factory's existing state layout (no migration needed).
 const GLOBAL_KEY: &[u8] = b"__safenear_global";
+/// SafeNear platform fee settings, also under their own key (no state migration).
+const PLATFORM_KEY: &[u8] = b"__safenear_platform";
+const DEFAULT_PLATFORM_FEE_BPS: u16 = 50; // 0.5% per trade
+const MAX_PLATFORM_FEE_BPS: u16 = 100; // 1%
 const MIN_DEV_BUY: u128 = 10_000_000_000_000_000_000_000; // 0.01 NEAR
 const MAX_ICON_LEN: usize = 12_000;
 const ONE_NEAR: u128 = 1_000_000_000_000_000_000_000_000;
@@ -74,6 +78,15 @@ pub struct GlobalMode {
     pub code_hash: [u8; 32],
     pub creation_fee: u128,
     pub token_account_balance: u128,
+}
+
+#[near(serializers = [borsh, json])]
+#[derive(Clone)]
+pub struct PlatformFee {
+    /// fee on every curve buy and sell, in basis points (50 = 0.5%)
+    pub fee_bps: u16,
+    /// where the fee goes; the factory itself by default (owner withdraws with withdraw_fees)
+    pub account: AccountId,
 }
 
 #[near(serializers = [json])]
@@ -184,6 +197,16 @@ impl Factory {
         }
     }
 
+    fn platform_fee(&self) -> PlatformFee {
+        env::storage_read(PLATFORM_KEY)
+            .and_then(|b| near_sdk::borsh::from_slice::<PlatformFee>(&b).ok())
+            .unwrap_or(PlatformFee { fee_bps: DEFAULT_PLATFORM_FEE_BPS, account: env::current_account_id() })
+    }
+
+    pub fn get_platform_fee(&self) -> PlatformFee {
+        self.platform_fee()
+    }
+
     fn global_mode(&self) -> Option<GlobalMode> {
         env::storage_read(GLOBAL_KEY)
             .and_then(|b| near_sdk::borsh::from_slice::<GlobalMode>(&b).ok())
@@ -283,6 +306,8 @@ impl Factory {
             "sell_tax_bps": sell_tax_bps,
             "fee_recipient": fee_recipient.unwrap_or_else(|| creator.clone()),
             "burn_bps": burn_bps.unwrap_or(0),
+            "platform_fee_bps": self.platform_fee().fee_bps,
+            "platform_account": self.platform_fee().account,
             "graduation_threshold": U128(self.graduation_threshold),
             "virtual_near": U128(self.virtual_near),
             "ref_contract": self.ref_contract,
@@ -528,6 +553,14 @@ impl Factory {
         if let Some(v) = token_account_balance { g.token_account_balance = v.0; }
         require!(g.token_account_balance <= g.creation_fee, "token_account_balance must be <= creation_fee");
         env::storage_write(GLOBAL_KEY, &near_sdk::borsh::to_vec(&g).unwrap());
+    }
+
+    /// Change the platform fee for FUTURE launches (existing tokens keep theirs). Max 1%.
+    pub fn set_platform_fee(&mut self, fee_bps: u16, account: Option<AccountId>) {
+        self.assert_owner();
+        require!(fee_bps <= MAX_PLATFORM_FEE_BPS, "Platform fee above 1% is not allowed");
+        let account = account.unwrap_or_else(|| self.platform_fee().account);
+        env::storage_write(PLATFORM_KEY, &near_sdk::borsh::to_vec(&PlatformFee { fee_bps, account }).unwrap());
     }
 
     /// Withdraw platform fees, keeping enough balance to cover the factory's own storage.
