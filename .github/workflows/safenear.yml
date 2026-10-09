@@ -20,6 +20,14 @@ on:
         description: "Publish token code globally (cheap launches, one-time cost)"
         type: boolean
         default: false
+      launch_fee:
+        description: "Launch fee in NEAR after Publish (0.25 = creator pays the storage; lower = SafeNear pays the rest)"
+        type: string
+        default: "0.25"
+      update_fee:
+        description: "Apply the launch fee above now (only after Publish)"
+        type: boolean
+        default: false
       update_curve:
         description: "Update the bonding curve for new launches (numbers below)"
         type: boolean
@@ -57,7 +65,7 @@ jobs:
           path: res/*.wasm
 
       - name: Deploy and publish
-        if: ${{ inputs.deploy || inputs.publish || inputs.update_curve }}
+        if: ${{ inputs.deploy || inputs.publish || inputs.update_curve || inputs.update_fee }}
         env:
           NETWORK: ${{ inputs.network }}
           CONFIRM_MAINNET: ${{ inputs.confirm_mainnet }}
@@ -69,6 +77,8 @@ jobs:
           DO_DEPLOY: ${{ inputs.deploy }}
           DO_PUBLISH: ${{ inputs.publish }}
           DO_CURVE: ${{ inputs.update_curve }}
+          DO_FEE: ${{ inputs.update_fee }}
+          LAUNCH_FEE: ${{ inputs.launch_fee }}
           CURVE_GRAD: ${{ inputs.graduation_near }}
           CURVE_VIRTUAL: ${{ inputs.virtual_near }}
         run: |
