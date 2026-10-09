@@ -49,6 +49,12 @@ const MAX_TRADES: usize = 30;
 const REF_POOL_FEE: u32 = 30;
 /// The final graduation step index; migration_step == DONE means LP is in place and locked.
 const DONE: u8 = 7;
+/// If a graduation step's callback never comes back (e.g. it ran out of gas), the lock
+/// opens again after this many blocks (~2 minutes) so anyone can retry. Liquidity can't get stuck.
+const MIGRATION_LOCK_BLOCKS: u64 = 120;
+/// Storage deposits graduation needs on Ref/wNEAR (about 0.25 NEAR) come out of the raised NEAR,
+/// so the token account itself only needs enough for its own state at launch.
+const GRADUATION_COSTS: u128 = 300_000_000_000_000_000_000_000; // 0.3 NEAR
 /// Creator's buy at launch is capped at 5% of supply.
 const MAX_DEV_TOKENS: u128 = 50_000_000 * ONE_TOKEN;
 const MAX_ICON_LEN: usize = 12_000;
@@ -192,6 +198,7 @@ pub struct Contract {
     lp_tokens: u128,
     migration_step: u8,
     migration_busy: bool,
+    migration_busy_since: u64,
     migrate_caller: Option<AccountId>,
     pool_id: Option<u64>,
     trades: Vec<Trade>,
@@ -290,6 +297,7 @@ impl Contract {
             lp_tokens: 0,
             migration_step: 0,
             migration_busy: false,
+            migration_busy_since: 0,
             migrate_caller: None,
             pool_id: None,
             trades: Vec::new(),
@@ -503,7 +511,7 @@ impl Contract {
 
         if self.near_reserve >= self.graduation_threshold {
             self.graduated = true;
-            self.lp_near = self.near_reserve;
+            self.lp_near = self.near_reserve.saturating_sub(GRADUATION_COSTS);
             self.lp_tokens = LP_SUPPLY + self.curve_tokens_left;
             self.curve_tokens_left = 0;
             self.report(self.creator.clone(), "graduated", 0);
@@ -558,8 +566,12 @@ impl Contract {
     pub fn migrate(&mut self) -> Promise {
         require!(self.graduated, "Not graduated yet");
         require!(self.migration_step < DONE, "Liquidity is already on Ref Finance and locked");
-        require!(!self.migration_busy, "A migration step is already running");
+        require!(
+            !self.migration_busy || env::block_height() > self.migration_busy_since + MIGRATION_LOCK_BLOCKS,
+            "A migration step is already running. Try again in about 2 minutes."
+        );
         self.migration_busy = true;
+        self.migration_busy_since = env::block_height();
         self.migrate_caller = Some(env::predecessor_account_id());
 
         let me = env::current_account_id();
@@ -601,8 +613,11 @@ impl Contract {
                 .ft_transfer_call(refx, U128(self.lp_near), None, String::new()),
             // 4: deposit our LP token allocation into Ref (we are the token contract)
             4 => {
-                self.token
-                    .internal_transfer(&me, &refx, self.lp_tokens, Some("SafeNear LP".into()));
+                // Retry-safe: only top up what Ref's ledger entry is missing from an earlier attempt.
+                let held = self.token.ft_balance_of(refx.clone()).0;
+                if held < self.lp_tokens {
+                    self.token.internal_transfer(&me, &refx, self.lp_tokens - held, Some("SafeNear LP".into()));
+                }
                 ext_ref::ext(refx)
                     .with_static_gas(tgas(40))
                     .ft_on_transfer(me.clone(), U128(self.lp_tokens), String::new())
@@ -627,7 +642,11 @@ impl Contract {
 
     #[private]
     pub fn on_migrate_step(&mut self, step: u8) -> bool {
-        self.migration_busy = false;
+        // A late callback from an earlier, timed-out attempt must not move the state backwards.
+        let current = step == self.migration_step;
+        if current {
+            self.migration_busy = false;
+        }
         let mut ok = true;
         let mut last: Vec<u8> = Vec::new();
         for i in 0..env::promise_results_count() {
@@ -639,7 +658,7 @@ impl Contract {
         let me = env::current_account_id();
         let refx = self.ref_contract.clone();
 
-        match step {
+        if current { match step {
             3 if ok => {
                 let used: U128 = serde_json::from_slice(&last).unwrap_or(U128(0));
                 ok = used.0 == self.lp_near;
@@ -664,9 +683,9 @@ impl Contract {
                 Err(_) => ok = false,
             },
             _ => {}
-        }
+        } }
 
-        if ok {
+        if ok && current {
             if let Some(caller) = self.migrate_caller.take() {
                 self.report(caller, "migrate", 0);
             }
@@ -866,6 +885,7 @@ mod tests {
         assert!(c.graduated);
         assert_eq!(c.near_reserve, 10 * NEAR);
         assert_eq!(c.lp_tokens, LP_SUPPLY);
+        assert_eq!(c.lp_near, 10 * NEAR - GRADUATION_COSTS);
     }
 
     #[test]
@@ -906,6 +926,46 @@ mod tests {
     #[should_panic(expected = "Tax above 4% a side")]
     fn tax_is_capped() {
         setup(401);
+    }
+
+    #[test]
+    fn stuck_migration_lock_reopens() {
+        let mut c = setup(0);
+        c.graduated = true;
+        c.lp_near = 10 * NEAR;
+        c.lp_tokens = LP_SUPPLY;
+        let mut ctx = VMContextBuilder::new();
+        ctx.current_account_id("dash.safenear.testnet".parse().unwrap())
+            .predecessor_account_id(accounts(1))
+            .account_balance(NearToken::from_near(20))
+            .prepaid_gas(Gas::from_tgas(300))
+            .block_height(1_000);
+        testing_env!(ctx.build());
+        let _ = c.migrate();
+        assert!(c.migration_busy);
+        // pretend the callback never arrived; after the lock window anyone can retry
+        ctx.block_height(1_000 + MIGRATION_LOCK_BLOCKS + 1);
+        testing_env!(ctx.build());
+        let _ = c.migrate();
+        assert_eq!(c.migration_busy_since, 1_000 + MIGRATION_LOCK_BLOCKS + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "already running")]
+    fn migration_lock_blocks_double_calls() {
+        let mut c = setup(0);
+        c.graduated = true;
+        c.lp_near = 10 * NEAR;
+        c.lp_tokens = LP_SUPPLY;
+        let mut ctx = VMContextBuilder::new();
+        ctx.current_account_id("dash.safenear.testnet".parse().unwrap())
+            .predecessor_account_id(accounts(1))
+            .account_balance(NearToken::from_near(20))
+            .prepaid_gas(Gas::from_tgas(300))
+            .block_height(1_000);
+        testing_env!(ctx.build());
+        let _ = c.migrate();
+        let _ = c.migrate();
     }
 
     #[test]
