@@ -1,0 +1,42 @@
+name: SafeNear build and deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: "Deploy the factory to NEAR testnet after building"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-near
+        run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/near/cargo-near/releases/latest/download/cargo-near-installer.sh | sh
+
+      - name: Build contracts
+        run: |
+          chmod +x scripts/*.sh
+          ./scripts/build.sh
+
+      - name: Run tests
+        run: cargo test -p safenear_token
+
+      - name: Save wasm files
+        uses: actions/upload-artifact@v4
+        with:
+          name: safenear-wasm
+          path: res/*.wasm
+
+      - name: Deploy factory to testnet
+        if: ${{ inputs.deploy }}
+        env:
+          NEAR_ACCOUNT_ID: ${{ secrets.NEAR_ACCOUNT_ID }}
+          NEAR_PRIVATE_KEY: ${{ secrets.NEAR_PRIVATE_KEY }}
+          NEAR_OWNER_ID: ${{ secrets.NEAR_OWNER_ID }}
+        run: |
+          npm install --no-save near-api-js@4.0.4
+          node scripts/deploy-ci.mjs
