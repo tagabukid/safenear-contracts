@@ -13,7 +13,10 @@ use near_sdk::{
 
 /// Built by scripts/build.sh before the factory is compiled.
 const TOKEN_WASM: &[u8] = include_bytes!("../../res/safenear_token.wasm");
-const MAX_TAX_BPS: u16 = 1_000;
+const MAX_TAX_BPS: u16 = 400; // 4% a side
+/// Global-contract launch settings live under their own storage key, so adding them
+/// doesn't change the factory's existing state layout (no migration needed).
+const GLOBAL_KEY: &[u8] = b"__safenear_global";
 const MIN_DEV_BUY: u128 = 10_000_000_000_000_000_000_000; // 0.01 NEAR
 const MAX_ICON_LEN: usize = 12_000;
 const ONE_NEAR: u128 = 1_000_000_000_000_000_000_000_000;
@@ -62,6 +65,27 @@ pub struct TokenInfo {
     pub symbol: String,
     pub creator: AccountId,
     pub created_at_ms: U64,
+}
+
+#[near(serializers = [borsh])]
+#[derive(Clone)]
+pub struct GlobalMode {
+    pub enabled: bool,
+    pub code_hash: [u8; 32],
+    pub creation_fee: u128,
+    pub token_account_balance: u128,
+}
+
+#[near(serializers = [json])]
+pub struct LaunchModeView {
+    /// true = tokens use the shared global token code (cheap launches)
+    pub global: bool,
+    pub code_hash_hex: Option<String>,
+    pub creation_fee: U128,
+    pub token_account_balance: U128,
+    pub token_code_bytes: u64,
+    /// One-time NEAR burned to publish the token code globally (10 NEAR per 100 KB)
+    pub publish_cost: U128,
 }
 
 #[near(serializers = [json])]
@@ -144,7 +168,7 @@ impl Factory {
     }
 
     pub fn get_creation_fee(&self) -> U128 {
-        U128(self.creation_fee)
+        U128(self.launch_terms().0)
     }
 
     pub fn get_config(&self) -> Config {
@@ -160,6 +184,32 @@ impl Factory {
         }
     }
 
+    fn global_mode(&self) -> Option<GlobalMode> {
+        env::storage_read(GLOBAL_KEY)
+            .and_then(|b| near_sdk::borsh::from_slice::<GlobalMode>(&b).ok())
+            .filter(|g| g.enabled)
+    }
+
+    /// (creation fee, NEAR sent to the new token account, global code hash if enabled)
+    fn launch_terms(&self) -> (u128, u128, Option<[u8; 32]>) {
+        match self.global_mode() {
+            Some(g) => (g.creation_fee, g.token_account_balance, Some(g.code_hash)),
+            None => (self.creation_fee, self.token_account_balance, None),
+        }
+    }
+
+    pub fn get_launch_mode(&self) -> LaunchModeView {
+        let (fee, bal, hash) = self.launch_terms();
+        LaunchModeView {
+            global: hash.is_some(),
+            code_hash_hex: hash.map(|h| h.iter().map(|b| format!("{:02x}", b)).collect()),
+            creation_fee: U128(fee),
+            token_account_balance: U128(bal),
+            token_code_bytes: TOKEN_WASM.len() as u64,
+            publish_cost: U128(TOKEN_WASM.len() as u128 * 10 * env::storage_byte_cost().as_yoctonear()),
+        }
+    }
+
     /* ------------------------------- launch ------------------------------- */
 
     /// Launch a token. Attach at least `get_creation_fee()` and 300 Tgas.
@@ -170,7 +220,10 @@ impl Factory {
         &mut self,
         name: String,
         symbol: String,
-        tax_bps: u16,
+        buy_tax_bps: u16,
+        sell_tax_bps: u16,
+        fee_recipient: Option<AccountId>,
+        burn_bps: Option<u16>,
         icon: Option<String>,
         description: Option<String>,
         website: Option<String>,
@@ -179,10 +232,8 @@ impl Factory {
     ) -> Promise {
         let creator = env::predecessor_account_id();
         let deposit = env::attached_deposit().as_yoctonear();
-        require!(
-            deposit >= self.creation_fee,
-            format!("Attach at least {} yoctoNEAR", self.creation_fee)
-        );
+        let (fee, account_balance, global_hash) = self.launch_terms();
+        require!(deposit >= fee, format!("Attach at least {} yoctoNEAR", fee));
         let name = name.trim().to_string();
         require!(!name.is_empty() && name.len() <= 32, "Name must be 1 to 32 characters");
         let symbol = symbol.trim().to_uppercase();
@@ -190,7 +241,11 @@ impl Factory {
             (2..=10).contains(&symbol.len()) && symbol.chars().all(|c| c.is_ascii_alphanumeric()),
             "Ticker must be 2 to 10 letters or numbers"
         );
-        require!(tax_bps <= MAX_TAX_BPS, "Tax above 10% is not allowed");
+        require!(
+            buy_tax_bps <= MAX_TAX_BPS && sell_tax_bps <= MAX_TAX_BPS,
+            "Tax above 4% a side is not allowed"
+        );
+        require!(burn_bps.unwrap_or(0) <= 10_000, "burn_bps must be between 0 and 10000");
         if let Some(i) = &icon {
             require!(
                 i.len() <= MAX_ICON_LEN && (i.starts_with("data:image/") || i.starts_with("https://")),
@@ -205,7 +260,7 @@ impl Factory {
         if let Some(d) = &description {
             require!(d.len() <= 280, "Description is too long (max 280 characters)");
         }
-        let extra = deposit - self.creation_fee;
+        let extra = deposit - fee;
         let dev_buy = if extra >= MIN_DEV_BUY { extra } else { 0 };
 
         let token_id: AccountId = format!("{}.{}", symbol.to_lowercase(), env::current_account_id())
@@ -224,7 +279,10 @@ impl Factory {
             "telegram": telegram,
             "initial_buy": U128(dev_buy),
             "creator": creator,
-            "tax_bps": tax_bps,
+            "buy_tax_bps": buy_tax_bps,
+            "sell_tax_bps": sell_tax_bps,
+            "fee_recipient": fee_recipient.unwrap_or_else(|| creator.clone()),
+            "burn_bps": burn_bps.unwrap_or(0),
             "graduation_threshold": U128(self.graduation_threshold),
             "virtual_near": U128(self.virtual_near),
             "ref_contract": self.ref_contract,
@@ -234,15 +292,19 @@ impl Factory {
         .into_bytes();
 
         // No add_full_access_key / add_access_key: the token account is keyless and immutable.
-        Promise::new(token_id.clone())
+        let p = Promise::new(token_id.clone())
             .create_account()
-            .transfer(NearToken::from_yoctonear(self.token_account_balance + dev_buy))
-            .deploy_contract(TOKEN_WASM.to_vec())
-            .function_call("new".to_string(), args, NearToken::from_yoctonear(0), Gas::from_tgas(60))
+            .transfer(NearToken::from_yoctonear(account_balance + dev_buy));
+        // Global mode: point the account at the shared token code (by hash, so it can never change).
+        let p = match global_hash {
+            Some(h) => p.use_global_contract(h),
+            None => p.deploy_contract(TOKEN_WASM.to_vec()),
+        };
+        p.function_call("new".to_string(), args, NearToken::from_yoctonear(0), Gas::from_tgas(60))
             .then(
                 Self::ext(env::current_account_id())
                     .with_static_gas(Gas::from_tgas(20))
-                    .on_token_created(token_id, name, symbol, creator, U128(deposit), U128(dev_buy)),
+                    .on_token_created(token_id, name, symbol, creator, U128(deposit), U128(dev_buy), U128(fee)),
             )
     }
 
@@ -255,6 +317,7 @@ impl Factory {
         creator: AccountId,
         deposit: U128,
         dev_buy: U128,
+        fee: U128,
     ) -> bool {
         let ok = matches!(env::promise_result(0), PromiseResult::Successful(_));
         let creator_for_points = creator.clone();
@@ -270,7 +333,7 @@ impl Factory {
                 self.award_trade(&creator_for_points, "buy", dev_buy.0);
             }
             // Leftover below the 0.01 NEAR dev-buy minimum goes back to the creator.
-            let extra = deposit.0 - self.creation_fee - dev_buy.0;
+            let extra = deposit.0 - fee.0 - dev_buy.0;
             if extra > 0 {
                 Promise::new(creator).transfer(NearToken::from_yoctonear(extra));
             }
@@ -422,6 +485,49 @@ impl Factory {
             self.token_account_balance <= self.creation_fee,
             "token_account_balance must be <= creation_fee"
         );
+    }
+
+    /// Publish the token code once as a global contract (by hash) and switch launches to it.
+    /// Burns about 10 NEAR per 100 KB of token code from the factory balance (see get_launch_mode).
+    pub fn publish_token_code(&mut self, creation_fee: U128, token_account_balance: U128) -> Promise {
+        self.assert_owner();
+        require!(token_account_balance.0 <= creation_fee.0, "token_account_balance must be <= creation_fee");
+        let hash = env::sha256_array(TOKEN_WASM);
+        Promise::new(env::current_account_id())
+            .deploy_global_contract(TOKEN_WASM.to_vec())
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(Gas::from_tgas(10))
+                    .on_code_published(hash.to_vec(), creation_fee, token_account_balance),
+            )
+    }
+
+    #[private]
+    pub fn on_code_published(&mut self, hash: Vec<u8>, creation_fee: U128, token_account_balance: U128) -> bool {
+        let ok = matches!(env::promise_result(0), PromiseResult::Successful(_));
+        if ok {
+            let mut code_hash = [0u8; 32];
+            code_hash.copy_from_slice(&hash);
+            let g = GlobalMode { enabled: true, code_hash, creation_fee: creation_fee.0, token_account_balance: token_account_balance.0 };
+            env::storage_write(GLOBAL_KEY, &near_sdk::borsh::to_vec(&g).unwrap());
+            log!("GLOBAL TOKEN CODE PUBLISHED. Launches now cost {} yoctoNEAR.", creation_fee.0);
+        } else {
+            log!("Publishing the global token code failed. Launches keep the old (full deploy) mode.");
+        }
+        ok
+    }
+
+    /// Adjust the cheap-launch fees, or turn global mode off (falls back to full deploys).
+    pub fn set_global_config(&mut self, enabled: bool, creation_fee: Option<U128>, token_account_balance: Option<U128>) {
+        self.assert_owner();
+        let mut g: GlobalMode = env::storage_read(GLOBAL_KEY)
+            .and_then(|b| near_sdk::borsh::from_slice(&b).ok())
+            .expect("Publish the token code first");
+        g.enabled = enabled;
+        if let Some(v) = creation_fee { g.creation_fee = v.0; }
+        if let Some(v) = token_account_balance { g.token_account_balance = v.0; }
+        require!(g.token_account_balance <= g.creation_fee, "token_account_balance must be <= creation_fee");
+        env::storage_write(GLOBAL_KEY, &near_sdk::borsh::to_vec(&g).unwrap());
     }
 
     /// Withdraw platform fees, keeping enough balance to cover the factory's own storage.
