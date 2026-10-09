@@ -13,6 +13,7 @@ Two Rust contracts for the SafeNear launchpad on NEAR.
 - **No admin, no upgrades.** Token accounts are created without keys, so nobody can change the code or pull funds.
 - **Tax cap.** Buy and sell tax are each 0 to 4%, set at launch, cannot change. Tax goes to a fee wallet and/or is burned (kept in the curve, raising the price for every holder).
 - **Locked liquidity.** At graduation all raised NEAR plus 200M tokens go into a Ref Finance pool. The LP shares sit in the token contract's own Ref account and there is no withdraw method.
+- **Platform fee.** SafeNear takes 0.5% of every curve buy and sell (capped at 1% in code), paid to the factory. Set at launch per token; the owner can change it for future launches only.
 - **Fair curve.** 800M tokens sell on a constant-product curve. The last buy is capped at the graduation threshold and any extra NEAR is refunded.
 
 ## Token page details and dev buy
