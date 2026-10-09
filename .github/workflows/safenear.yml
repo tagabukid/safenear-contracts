@@ -3,10 +3,35 @@ name: SafeNear build and deploy
 on:
   workflow_dispatch:
     inputs:
+      network:
+        description: "Network"
+        type: choice
+        options: [testnet, mainnet]
+        default: testnet
+      confirm_mainnet:
+        description: "Mainnet only: type DEPLOY MAINNET to confirm"
+        type: string
+        default: ""
       deploy:
         description: "Deploy the factory to NEAR testnet after building"
         type: boolean
         default: false
+      publish:
+        description: "Publish token code globally (cheap launches, one-time cost)"
+        type: boolean
+        default: false
+      update_curve:
+        description: "Update the bonding curve for new launches (numbers below)"
+        type: boolean
+        default: false
+      graduation_near:
+        description: "Graduates (bonds) at this many NEAR raised"
+        type: string
+        default: "100"   # mainnet: 1000
+      virtual_near:
+        description: "Virtual NEAR reserve (sets the starting price; about 30% of graduation)"
+        type: string
+        default: "30"    # mainnet: 300
 
 jobs:
   build:
@@ -31,13 +56,21 @@ jobs:
           name: safenear-wasm
           path: res/*.wasm
 
-      - name: Deploy factory to testnet
-        if: ${{ inputs.deploy }}
+      - name: Deploy and publish
+        if: ${{ inputs.deploy || inputs.publish || inputs.update_curve }}
         env:
-          NEAR_ACCOUNT_ID: ${{ secrets.NEAR_ACCOUNT_ID }}
-          NEAR_PRIVATE_KEY: ${{ secrets.NEAR_PRIVATE_KEY }}
-          NEAR_SEED_PHRASE: ${{ secrets.NEAR_SEED_PHRASE }}
+          NETWORK: ${{ inputs.network }}
+          CONFIRM_MAINNET: ${{ inputs.confirm_mainnet }}
+          # Mainnet uses its own secrets so a testnet key can never touch mainnet (and the reverse).
+          NEAR_ACCOUNT_ID: ${{ inputs.network == 'mainnet' && secrets.MAINNET_ACCOUNT_ID || secrets.NEAR_ACCOUNT_ID }}
+          NEAR_PRIVATE_KEY: ${{ inputs.network == 'mainnet' && secrets.MAINNET_PRIVATE_KEY || secrets.NEAR_PRIVATE_KEY }}
+          NEAR_SEED_PHRASE: ${{ inputs.network == 'mainnet' && secrets.MAINNET_SEED_PHRASE || secrets.NEAR_SEED_PHRASE }}
           NEAR_OWNER_ID: ${{ secrets.NEAR_OWNER_ID }}
+          DO_DEPLOY: ${{ inputs.deploy }}
+          DO_PUBLISH: ${{ inputs.publish }}
+          DO_CURVE: ${{ inputs.update_curve }}
+          CURVE_GRAD: ${{ inputs.graduation_near }}
+          CURVE_VIRTUAL: ${{ inputs.virtual_near }}
         run: |
           npm install --no-save near-api-js@4.0.4 near-seed-phrase@0.2.1
           node scripts/deploy-ci.mjs
