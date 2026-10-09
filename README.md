@@ -11,9 +11,17 @@ Two Rust contracts for the SafeNear launchpad on NEAR.
 
 - **Fixed supply.** 1,000,000,000 tokens, minted once in `new`. No mint function exists.
 - **No admin, no upgrades.** Token accounts are created without keys, so nobody can change the code or pull funds.
-- **Tax cap.** Creator tax is 0 to 10%, set at launch, cannot change.
+- **Tax cap.** Buy and sell tax are each 0 to 4%, set at launch, cannot change. Tax goes to a fee wallet and/or is burned (kept in the curve, raising the price for every holder).
 - **Locked liquidity.** At graduation all raised NEAR plus 200M tokens go into a Ref Finance pool. The LP shares sit in the token contract's own Ref account and there is no withdraw method.
 - **Fair curve.** 800M tokens sell on a constant-product curve. The last buy is capped at the graduation threshold and any extra NEAR is refunded.
+
+## Token page details and dev buy
+
+`create_token` also takes an optional `icon` (a data:image up to 12 KB, the frontend resizes uploads to 96 × 96),
+`description` (280 characters), and `website` / `twitter` / `telegram` (https:// links only). Read them with `get_info()`.
+
+Any NEAR attached above the creation fee becomes the creator's **buy at launch**: no tax, capped at 5% of supply
+(50M tokens), never fills the curve, and unused NEAR is refunded. The amount is public in `get_info().dev_buy_tokens`.
 
 ## Token supply
 
@@ -36,6 +44,8 @@ cargo test -p safenear_token # curve math tests
 ```
 
 ## Deploy to testnet
+
+The easiest way is GitHub Actions: **Actions → SafeNear build and deploy → Run workflow** (secrets `NEAR_ACCOUNT_ID` and `NEAR_PRIVATE_KEY`). Or from a terminal:
 
 1. Make a testnet account and get faucet NEAR (you need about 15 NEAR: 9 for the factory, 5 to launch a token, plus gas).
 2. Log in so the CLI has your key: `near account import-account`
@@ -97,6 +107,14 @@ node scripts/export-points.mjs safenear.tagabukid.testnet > points.csv
 Testnet accounts and NEAR are free, so one person can farm with many accounts. Review the CSV before paying out
 (for example: same mainnet wallet linked by many accounts, accounts created the same minute, trades only between
 each other) and say clearly on the site that farmed points can be removed.
+
+## Mainnet
+
+The same workflow deploys to mainnet. Mainnet uses **its own secrets** so a testnet key can never touch it:
+`MAINNET_ACCOUNT_ID` (ends in `.near`) and `MAINNET_PRIVATE_KEY` (or `MAINNET_SEED_PHRASE`).
+
+Run workflow with: network `mainnet`, type `DEPLOY MAINNET` in the confirm box, check Deploy, Publish and
+Update curve, and use graduation `1000` / virtual `300`. Ref and wNEAR switch to `v2.ref-finance.near` / `wrap.near`.
 
 ## Before mainnet
 
