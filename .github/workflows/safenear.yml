@@ -36,7 +36,8 @@ jobs:
         env:
           NEAR_ACCOUNT_ID: ${{ secrets.NEAR_ACCOUNT_ID }}
           NEAR_PRIVATE_KEY: ${{ secrets.NEAR_PRIVATE_KEY }}
+          NEAR_SEED_PHRASE: ${{ secrets.NEAR_SEED_PHRASE }}
           NEAR_OWNER_ID: ${{ secrets.NEAR_OWNER_ID }}
         run: |
-          npm install --no-save near-api-js@4.0.4
+          npm install --no-save near-api-js@4.0.4 near-seed-phrase@0.2.1
           node scripts/deploy-ci.mjs
