@@ -12,12 +12,22 @@ const fail = (title, msg) => {
 const note = (msg) => console.log(`::notice title=SafeNear deploy::${msg}`);
 
 const accountId = (process.env.NEAR_ACCOUNT_ID || "").trim();
-const privateKey = (process.env.NEAR_PRIVATE_KEY || "").trim();
+let privateKey = (process.env.NEAR_PRIVATE_KEY || "").trim();
+const seedPhrase = (process.env.NEAR_SEED_PHRASE || "").trim().toLowerCase().replace(/\s+/g, " ");
+
+// Use the 12-word seed phrase if there's no private key (same derivation path as MyNearWallet).
+if (!privateKey && seedPhrase) {
+  const words = seedPhrase.split(" ").length;
+  if (words !== 12 && words !== 24) fail("Seed phrase looks wrong", `NEAR_SEED_PHRASE has ${words} words. It should be the 12 words from your wallet, separated by spaces.`);
+  const { parseSeedPhrase } = await import("near-seed-phrase");
+  privateKey = parseSeedPhrase(seedPhrase).secretKey;
+  console.log("Using the key from NEAR_SEED_PHRASE.");
+}
 const owner = (process.env.NEAR_OWNER_ID || "").trim() || accountId;
 
 // 1. Secrets present?
 if (!accountId) fail("Missing NEAR_ACCOUNT_ID", "Add the secret NEAR_ACCOUNT_ID with your wallet name, for example testnettestes.testnet");
-if (!privateKey) fail("Missing NEAR_PRIVATE_KEY", "Add the secret NEAR_PRIVATE_KEY with your wallet's private key (starts with ed25519:)");
+if (!privateKey) fail("Missing key", "Add the secret NEAR_SEED_PHRASE with your wallet's 12 words (or NEAR_PRIVATE_KEY with the private key).");
 if (!accountId.endsWith(".testnet")) fail("Wrong account name", `NEAR_ACCOUNT_ID is "${accountId}". It must be a testnet account ending in .testnet`);
 
 // 2. Key format
@@ -49,7 +59,7 @@ const balance = Number(BigInt(state.amount) / 10n ** 21n) / 1000;
 // 5. Key belongs to this account?
 const keys = await near.connection.provider.query({ request_type: "view_access_key_list", finality: "final", account_id: accountId });
 const match = keys.keys.find((k) => k.public_key === publicKey);
-if (!match) fail("Key doesn't match the account", `NEAR_PRIVATE_KEY belongs to a different wallet than ${accountId}. Export the private key from the ${accountId} wallet itself.`);
+if (!match) fail("Key doesn't match the account", `The key or seed phrase belongs to a different wallet than ${accountId}. Use the 12 words of the ${accountId} wallet itself.`);
 if (match.access_key.permission !== "FullAccess") fail("Key has limited access", "This key can only call some contracts. Export the wallet's FULL ACCESS private key instead.");
 
 // 6. Enough NEAR for the code storage?
