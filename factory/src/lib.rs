@@ -14,6 +14,8 @@ use near_sdk::{
 /// Built by scripts/build.sh before the factory is compiled.
 const TOKEN_WASM: &[u8] = include_bytes!("../../res/safenear_token.wasm");
 const MAX_TAX_BPS: u16 = 1_000;
+const MIN_DEV_BUY: u128 = 10_000_000_000_000_000_000_000; // 0.01 NEAR
+const MAX_ICON_LEN: usize = 12_000;
 const ONE_NEAR: u128 = 1_000_000_000_000_000_000_000_000;
 const DAY_MS: u64 = 86_400_000;
 
@@ -161,8 +163,20 @@ impl Factory {
     /* ------------------------------- launch ------------------------------- */
 
     /// Launch a token. Attach at least `get_creation_fee()` and 300 Tgas.
+    /// Any NEAR attached above the creation fee becomes the creator's buy at launch
+    /// (no tax, capped at 5% of supply by the token contract, unused part refunded).
     #[payable]
-    pub fn create_token(&mut self, name: String, symbol: String, tax_bps: u16) -> Promise {
+    pub fn create_token(
+        &mut self,
+        name: String,
+        symbol: String,
+        tax_bps: u16,
+        icon: Option<String>,
+        description: Option<String>,
+        website: Option<String>,
+        twitter: Option<String>,
+        telegram: Option<String>,
+    ) -> Promise {
         let creator = env::predecessor_account_id();
         let deposit = env::attached_deposit().as_yoctonear();
         require!(
@@ -177,6 +191,22 @@ impl Factory {
             "Ticker must be 2 to 10 letters or numbers"
         );
         require!(tax_bps <= MAX_TAX_BPS, "Tax above 10% is not allowed");
+        if let Some(i) = &icon {
+            require!(
+                i.len() <= MAX_ICON_LEN && (i.starts_with("data:image/") || i.starts_with("https://")),
+                "Image must be a small data:image or https:// link (max 12 KB)"
+            );
+        }
+        for (v, what) in [(&website, "Website"), (&twitter, "X link"), (&telegram, "Telegram link")] {
+            if let Some(l) = v {
+                require!(l.len() <= 200 && l.starts_with("https://"), format!("{} must be an https:// link", what));
+            }
+        }
+        if let Some(d) = &description {
+            require!(d.len() <= 280, "Description is too long (max 280 characters)");
+        }
+        let extra = deposit - self.creation_fee;
+        let dev_buy = if extra >= MIN_DEV_BUY { extra } else { 0 };
 
         let token_id: AccountId = format!("{}.{}", symbol.to_lowercase(), env::current_account_id())
             .parse()
@@ -187,7 +217,12 @@ impl Factory {
         let args = json!({
             "name": name,
             "symbol": symbol,
-            "icon": null,
+            "icon": icon,
+            "description": description,
+            "website": website,
+            "twitter": twitter,
+            "telegram": telegram,
+            "initial_buy": U128(dev_buy),
             "creator": creator,
             "tax_bps": tax_bps,
             "graduation_threshold": U128(self.graduation_threshold),
@@ -201,13 +236,13 @@ impl Factory {
         // No add_full_access_key / add_access_key: the token account is keyless and immutable.
         Promise::new(token_id.clone())
             .create_account()
-            .transfer(NearToken::from_yoctonear(self.token_account_balance))
+            .transfer(NearToken::from_yoctonear(self.token_account_balance + dev_buy))
             .deploy_contract(TOKEN_WASM.to_vec())
-            .function_call("new".to_string(), args, NearToken::from_yoctonear(0), Gas::from_tgas(30))
+            .function_call("new".to_string(), args, NearToken::from_yoctonear(0), Gas::from_tgas(60))
             .then(
                 Self::ext(env::current_account_id())
                     .with_static_gas(Gas::from_tgas(20))
-                    .on_token_created(token_id, name, symbol, creator, U128(deposit)),
+                    .on_token_created(token_id, name, symbol, creator, U128(deposit), U128(dev_buy)),
             )
     }
 
@@ -219,6 +254,7 @@ impl Factory {
         symbol: String,
         creator: AccountId,
         deposit: U128,
+        dev_buy: U128,
     ) -> bool {
         let ok = matches!(env::promise_result(0), PromiseResult::Successful(_));
         let creator_for_points = creator.clone();
@@ -230,7 +266,11 @@ impl Factory {
                 creator: creator.clone(),
                 created_at_ms: U64(env::block_timestamp_ms()),
             });
-            let extra = deposit.0 - self.creation_fee;
+            if dev_buy.0 > 0 {
+                self.award_trade(&creator_for_points, "buy", dev_buy.0);
+            }
+            // Leftover below the 0.01 NEAR dev-buy minimum goes back to the creator.
+            let extra = deposit.0 - self.creation_fee - dev_buy.0;
             if extra > 0 {
                 Promise::new(creator).transfer(NearToken::from_yoctonear(extra));
             }
@@ -280,14 +320,18 @@ impl Factory {
             self.live.contains(&env::predecessor_account_id()),
             "Only SafeNear tokens can report points"
         );
+        self.award_trade(&account_id, &kind, near_amount.0);
+    }
+
+    fn award_trade(&mut self, account_id: &AccountId, kind: &str, near_amount: u128) {
         if !self.points_open {
             return;
         }
-        let e = self.entry(&account_id);
-        match kind.as_str() {
+        let e = self.entry(account_id);
+        match kind {
             "buy" | "sell" => {
                 let rate = if kind == "buy" { PTS_PER_NEAR_BUY } else { PTS_PER_NEAR_SELL };
-                let earned = (near_amount.0 * rate / ONE_NEAR) as u32;
+                let earned = (near_amount * rate / ONE_NEAR) as u32;
                 let room = MAX_TRADE_PTS_PER_DAY.saturating_sub(e.day_trade_pts);
                 let add = earned.min(room);
                 e.day_trade_pts += add;
