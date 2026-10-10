@@ -25,6 +25,46 @@ const DEFAULT_PLATFORM_FEE_BPS: u16 = 50; // 0.5% per trade
 const FREE_LAUNCHES_PER_DAY: u8 = 1;
 const FREE_LAUNCH_PREFIX: &[u8] = b"__fl:";
 /// The factory always keeps this much free so subsidies can't eat into its own storage.
+/* ---- analytics (own storage keys, no state migration) ---- */
+const AN_TOTALS: &[u8] = b"__an:p";
+const AN_HOUR: &[u8] = b"__an:h:";
+const AN_TOKEN: &[u8] = b"__an:t:";
+const AN_TRADER: &[u8] = b"__an:u:";
+const AN_RING_HOURS: u64 = 720; // 30 days of hourly buckets, reused in a ring
+const HOUR_MS: u64 = 3_600_000;
+/// Trades below this don't create a "trader" record, so dust spam can't grow storage.
+const AN_MIN_TRADER: u128 = 50_000_000_000_000_000_000_000; // 0.05 NEAR
+
+#[near(serializers = [borsh])]
+#[derive(Clone, Default)]
+pub struct AnTotals { pub volume: u128, pub trades: u64, pub buys: u64, pub sells: u64, pub launches: u64, pub traders: u64, pub since_ms: u64 }
+
+#[near(serializers = [borsh])]
+#[derive(Clone, Default)]
+pub struct AnBucket { pub hour: u64, pub volume: u128, pub trades: u32, pub buys: u32, pub sells: u32, pub launches: u32, pub new_traders: u32 }
+
+#[near(serializers = [borsh])]
+#[derive(Clone, Default)]
+pub struct AnToken { pub volume: u128, pub trades: u32, pub buys: u32, pub sells: u32, pub hours: Vec<(u64, u128)> }
+
+#[near(serializers = [json])]
+pub struct ProtocolStatsView {
+    /// null = all time
+    pub hours: Option<u32>,
+    pub volume: U128,
+    pub trades: U64,
+    pub buys: U64,
+    pub sells: U64,
+    pub launches: U64,
+    /// new traders in the window, or all traders for all time
+    pub traders: U64,
+    pub tokens_live: u64,
+    pub since_ms: U64,
+}
+
+#[near(serializers = [json])]
+pub struct TokenStatsView { pub token_id: AccountId, pub volume_24h: U128, pub volume_total: U128, pub trades: u32, pub buys: u32, pub sells: u32 }
+
 const SUBSIDY_RESERVE: u128 = 1_000_000_000_000_000_000_000_000; // 1 NEAR
 const MAX_PLATFORM_FEE_BPS: u16 = 100; // 1%
 const MIN_DEV_BUY: u128 = 10_000_000_000_000_000_000_000; // 0.01 NEAR
@@ -394,6 +434,7 @@ impl Factory {
                 Promise::new(creator).transfer(NearToken::from_yoctonear(extra));
             }
             self.live.insert(token_id.clone());
+            Self::an_launch();
             self.award_create(&creator_for_points);
             log!("LAUNCHED {}", token_id);
         } else {
@@ -435,11 +476,125 @@ impl Factory {
     /// Called by SafeNear token contracts only. kind: "buy" | "sell" | "graduated" | "migrate".
     /// Never panics on bad input so it can't break a trade.
     pub fn record_event(&mut self, account_id: AccountId, kind: String, near_amount: U128) {
-        require!(
-            self.live.contains(&env::predecessor_account_id()),
-            "Only SafeNear tokens can report points"
-        );
+        let token = env::predecessor_account_id();
+        require!(self.live.contains(&token), "Only SafeNear tokens can report");
+        if kind == "buy" || kind == "sell" {
+            self.an_trade(&token, &account_id, kind == "buy", near_amount.0);
+        }
         self.award_trade(&account_id, &kind, near_amount.0);
+    }
+
+    /* ------------------------------ analytics ------------------------------ */
+
+    fn an_read<T: near_sdk::borsh::BorshDeserialize + Default>(key: &[u8]) -> T {
+        env::storage_read(key).and_then(|b| near_sdk::borsh::from_slice(&b).ok()).unwrap_or_default()
+    }
+    fn an_write<T: near_sdk::borsh::BorshSerialize>(key: &[u8], v: &T) {
+        env::storage_write(key, &near_sdk::borsh::to_vec(v).unwrap());
+    }
+    fn an_hour_key(hour: u64) -> Vec<u8> {
+        [AN_HOUR, &(hour % AN_RING_HOURS).to_le_bytes()].concat()
+    }
+    fn an_bump_hour(f: impl FnOnce(&mut AnBucket)) {
+        let hour = env::block_timestamp_ms() / HOUR_MS;
+        let key = Self::an_hour_key(hour);
+        let mut b: AnBucket = Self::an_read(&key);
+        if b.hour != hour {
+            b = AnBucket { hour, ..Default::default() };
+        }
+        f(&mut b);
+        Self::an_write(&key, &b);
+    }
+    fn an_totals() -> AnTotals {
+        let mut t: AnTotals = Self::an_read(AN_TOTALS);
+        if t.since_ms == 0 {
+            t.since_ms = env::block_timestamp_ms();
+        }
+        t
+    }
+
+    fn an_trade(&mut self, token: &AccountId, trader: &AccountId, buy: bool, amount: u128) {
+        let mut t = Self::an_totals();
+        t.volume += amount;
+        t.trades += 1;
+        if buy { t.buys += 1 } else { t.sells += 1 }
+        let mut new_trader = false;
+        if amount >= AN_MIN_TRADER {
+            let key = [AN_TRADER, trader.as_str().as_bytes()].concat();
+            if !env::storage_has_key(&key) {
+                env::storage_write(&key, &(env::block_timestamp_ms() / HOUR_MS).to_le_bytes());
+                t.traders += 1;
+                new_trader = true;
+            }
+        }
+        Self::an_write(AN_TOTALS, &t);
+        Self::an_bump_hour(|b| {
+            b.volume += amount;
+            b.trades += 1;
+            if buy { b.buys += 1 } else { b.sells += 1 }
+            if new_trader { b.new_traders += 1 }
+        });
+        let key = [AN_TOKEN, token.as_str().as_bytes()].concat();
+        let mut s: AnToken = Self::an_read(&key);
+        let hour = env::block_timestamp_ms() / HOUR_MS;
+        if s.hours.len() < 24 {
+            s.hours = vec![(0, 0); 24];
+        }
+        let slot = (hour % 24) as usize;
+        if s.hours[slot].0 != hour {
+            s.hours[slot] = (hour, 0);
+        }
+        s.hours[slot].1 += amount;
+        s.volume += amount;
+        s.trades += 1;
+        if buy { s.buys += 1 } else { s.sells += 1 }
+        Self::an_write(&key, &s);
+    }
+
+    fn an_launch() {
+        let mut t = Self::an_totals();
+        t.launches += 1;
+        Self::an_write(AN_TOTALS, &t);
+        Self::an_bump_hour(|b| b.launches += 1);
+    }
+
+    /// Protocol totals for the last `hours` (1..=720), or all time when hours is omitted.
+    /// Counting starts when this analytics version was deployed.
+    pub fn get_protocol_stats(&self, hours: Option<u32>) -> ProtocolStatsView {
+        let t = Self::an_totals();
+        let tokens_live = self.tokens.len() as u64;
+        match hours {
+            None => ProtocolStatsView {
+                hours: None, volume: U128(t.volume), trades: U64(t.trades), buys: U64(t.buys), sells: U64(t.sells),
+                launches: U64(t.launches), traders: U64(t.traders), tokens_live, since_ms: U64(t.since_ms),
+            },
+            Some(h) => {
+                let h = (h.max(1) as u64).min(AN_RING_HOURS);
+                let now = env::block_timestamp_ms() / HOUR_MS;
+                let (mut v, mut tr, mut b, mut s, mut l, mut n) = (0u128, 0u64, 0u64, 0u64, 0u64, 0u64);
+                for hour in (now + 1).saturating_sub(h)..=now {
+                    let k: AnBucket = Self::an_read(&Self::an_hour_key(hour));
+                    if k.hour == hour {
+                        v += k.volume; tr += k.trades as u64; b += k.buys as u64; s += k.sells as u64;
+                        l += k.launches as u64; n += k.new_traders as u64;
+                    }
+                }
+                ProtocolStatsView {
+                    hours: Some(h as u32), volume: U128(v), trades: U64(tr), buys: U64(b), sells: U64(s),
+                    launches: U64(l), traders: U64(n), tokens_live, since_ms: U64(t.since_ms),
+                }
+            }
+        }
+    }
+
+    /// Per-token volume (last 24h and all time) and trade counts. Up to 100 tokens per call.
+    pub fn get_token_stats(&self, token_ids: Vec<AccountId>) -> Vec<TokenStatsView> {
+        let now = env::block_timestamp_ms() / HOUR_MS;
+        token_ids.into_iter().take(100).map(|id| {
+            let s: AnToken = Self::an_read(&[AN_TOKEN, id.as_str().as_bytes()].concat());
+            let v24 = s.hours.iter().filter(|(h, _)| *h + 24 > now).map(|(_, v)| *v).sum::<u128>();
+            TokenStatsView { token_id: id, volume_24h: U128(v24), volume_total: U128(s.volume), trades: s.trades, buys: s.buys, sells: s.sells }
+        }).collect()
     }
 
     fn award_trade(&mut self, account_id: &AccountId, kind: &str, near_amount: u128) {
@@ -570,6 +725,22 @@ impl Factory {
             log!("Publishing the global token code failed. Launches keep the old (full deploy) mode.");
         }
         ok
+    }
+
+    /// Recovery: switch launches to the global token code when it was already published but the
+    /// publish callback didn't record it. Uses this factory's own token code hash, so it can only
+    /// point at code the factory carries. If that code isn't actually published, launches fail
+    /// safely and the creator is refunded.
+    pub fn activate_global_code(&mut self, creation_fee: U128, token_account_balance: U128) {
+        self.assert_owner();
+        let g = GlobalMode {
+            enabled: true,
+            code_hash: env::sha256_array(TOKEN_WASM),
+            creation_fee: creation_fee.0,
+            token_account_balance: token_account_balance.0,
+        };
+        env::storage_write(GLOBAL_KEY, &near_sdk::borsh::to_vec(&g).unwrap());
+        log!("Global token code activated.");
     }
 
     /// Adjust the cheap-launch fees, or turn global mode off (falls back to full deploys).
